@@ -54,5 +54,7 @@ def main():
     global if_show;if_show=True
 
     analysis_file(args.log_path)
+
+
 if __name__=='__main__':
     main()

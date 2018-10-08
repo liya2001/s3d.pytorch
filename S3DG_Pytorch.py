@@ -1,5 +1,8 @@
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
+import os
+
 
 class BasicConv3d(nn.Module):
     def __init__(self, in_planes, out_planes, kernel_size, stride, padding=0):
@@ -29,8 +32,8 @@ class STConv3d(nn.Module):
         self.bn2=nn.BatchNorm3d(out_planes, eps=1e-3, momentum=0.001, affine=True)
         self.relu2=nn.ReLU(inplace=True)
         
-        nn.init.normal(self.conv2.weight,mean=0,std=0.01)
-        nn.init.constant(self.conv2.bias,0)
+        nn.init.normal_(self.conv2.weight,mean=0,std=0.01)
+        nn.init.constant_(self.conv2.bias,0)
     
     def forward(self,x):
         x=self.conv(x)
@@ -309,7 +312,7 @@ class Mixed_5c(nn.Module):
 
 class S3DG(nn.Module):
 
-    def __init__(self, num_classes=400, dropout_keep_prob = 1, input_channel = 3, spatial_squeeze=True):
+    def __init__(self, num_classes=400, dropout_keep_prob=1, input_channel = 3, spatial_squeeze=True):
         super(S3DG, self).__init__()
         self.features = nn.Sequential(
             STConv3d(input_channel, 64, kernel_size=7, stride=2, padding=3), # (64, 32, 112, 112)
@@ -333,7 +336,6 @@ class S3DG(nn.Module):
             nn.Conv3d(1024, num_classes, kernel_size=1, stride=1, bias=True),# (400, 8, 1, 1)
         )
         self.spatial_squeeze = spatial_squeeze
-        self.softmax = nn.Softmax()
 
     def forward(self, x):
         logits = self.features(x)
@@ -343,16 +345,18 @@ class S3DG(nn.Module):
             logits = logits.squeeze(3)
 
         averaged_logits = torch.mean(logits, 2)
-        predictions = self.softmax(averaged_logits)
+        predictions = F.softmax(averaged_logits, dim=1)
 
         return predictions, averaged_logits
 
-    def load_state_dict(self,path):
+    def load_state_dict(self, path):
         target_weights=torch.load(path)
         own_state=self.state_dict()
 
         for name, param in target_weights.items():
-            
+            print(name, param.size())
+            if name.startswith('features.18'):
+                continue
             if name in own_state:
                 if isinstance(param,nn.Parameter):
                     param=param.data
@@ -367,10 +371,10 @@ class S3DG(nn.Module):
                                        whose dimensions in the checkpoint are {}.\
                                        '.format(name,own_state[name].size(),param.size()))
             else:
-               print '{} meets error in locating parameters'.format(name)
-        missing=set(own_state.keys())-set(target_weights.keys())
+                print('{} meets error in locating parameters'.format(name))
+        missing = set(own_state.keys())-set(target_weights.keys())
 
-        print '{} keys are not holded in target checkpoints'.format(len(missing))
+        print('{} keys are not holded in target checkpoints'.format(len(missing)))
         
 
 if __name__=='__main__':
@@ -380,9 +384,9 @@ if __name__=='__main__':
     # Initialize the weights with pretrained I3D net. In detail, 
     # please refer to specific reproduced load_state_dict() function
     if not os.path.exists('modelweights/RGB_imagenet.pkl'):
-        print 'No weights Found! please download first, or comment 382~384th line'
+        print('No weights Found! please download first, or comment 382~384th line')
     model.load_state_dict('modelweights/RGB_imagenet.pkl')
     model=model.cuda()
     data=torch.autograd.Variable(torch.rand(2,3,64,224,224))#.cuda())
     out=model(data)[0]
-    print out.size()
+    print(out.size())

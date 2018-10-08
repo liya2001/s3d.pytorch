@@ -1,3 +1,20 @@
 #!/usr/bin/env bash
-#cd /local/MI/zqj/temporal_action_localization/TAL
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python trainval.py kinetics RGB train.list val.list --arch S3DG --epochs 32 --lr_steps 10 24 -d 16 -b 24 --lr 0.01 -p 20 -ef 1 -j 8 --snapshot_pref modelweights/I3D --flow_pref flow_
+
+#data-set
+model_name="detection"
+modality="Flow"
+DATE=`date '+%Y-%m-%d-%H-%M-%S'`
+
+mkdir -p ./nohups/$model_name/$modality
+mkdir -p ./models/$model_name/$modality/$DATE
+
+nohup python trainval.py $model_name $modality \
+        --data_path /home/ly/workspace/trecvid/data/person_vehicle_interaction \
+        --pretrained_weights kinetics_flow.pth \
+        --train_list train_label_file.txt \
+        --val_list val_label_file.txt \
+        --arch S3DG --gpus 0 1 \
+        --gd 20 --lr 0.001 --lr_steps 190 300 --epochs 340 \
+        -b 48 -d 8 --dropout 0.5 \
+        --snapshot_pref ./models/$model_name/$modality/$DATE/epoch \
+> nohups/$model_name/$modality/${DATE}-log.out 2>&1 &

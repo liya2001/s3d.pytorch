@@ -7,6 +7,7 @@ import math
 import torch
 from log import log
 
+
 class GroupRandomCrop(object):
     def __init__(self, size):
         if isinstance(size, numbers.Number):
@@ -130,7 +131,7 @@ class GroupOverSample(object):
 class GroupMultiScaleCrop(object):
 
     def __init__(self, input_size, scales=None, max_distort=1, fix_crop=True, more_fix_crop=True):
-        self.scales = scales if scales is not None else [1, 875, .75, .66]
+        self.scales = scales if scales is not None else [1, .875, .75, .66]
         self.max_distort = max_distort
         self.fix_crop = fix_crop  # if False, random
         self.more_fix_crop = more_fix_crop
@@ -254,14 +255,15 @@ class Stack(object):
         self.Multi_images = Multi_images
 
     def __call__(self, img_group):
-        # if img_group[0].mode == 'L':
-        #     return np.concatenate([np.expand_dims(x, 2) for x in img_group], axis=2)
-        # elif img_group[0].mode == 'RGB':
-        #     if self.roll:
-        #         return np.concatenate([np.array(x)[:, :, ::-1] for x in img_group], axis=2)
-        #     else:
-        #         return np.concatenate(img_group, axis=2)
-        return np.concatenate([np.expand_dims(x,0) for x in img_group], axis=0)
+        if img_group[0].mode == 'L':
+            # convert list[flow_x, flow_y, flow_x, flow_y, ...] to C * D * H * W
+            # h, w
+            img_size = np.array(img_group[0]).shape
+            return np.stack(img_group).reshape((-1, 2)+img_size).transpose((1, 0, 2, 3))
+        elif img_group[0].mode == 'RGB':
+            # convert list[h*w*c, ...] to C * D * H * W
+            return np.stack(img_group).transpose((3, 0, 1, 2))
+        # return np.concatenate([np.expand_dims(x,0) for x in img_group], axis=0)
 
 
 class ToTorchFormatTensor(object):
@@ -270,6 +272,7 @@ class ToTorchFormatTensor(object):
     def __init__(self, div=True, Multi_images=False):
         self.div = div
         self.Multi_images=Multi_images
+        assert Multi_images is False  #
 
     def __call__(self, pic):
         #print(pic.shape)
@@ -277,7 +280,7 @@ class ToTorchFormatTensor(object):
             # handle numpy array
             if not self.Multi_images:
                 img = torch.from_numpy(pic)
-                img = img.permute(3, 0, 1, 2).contiguous()
+                # img = img.permute(3, 0, 1, 2).contiguous()
             else:
                 img = torch.from_numpy(pic)
                 sizes = img.size()
@@ -290,7 +293,8 @@ class ToTorchFormatTensor(object):
             # put it from HWC to CHW format
             # yikes, this transpose takes 80% of the loading time/CPU
             img = img.transpose(0, 1).transpose(0, 2).contiguous()
-        return img.float().div(255) if self.div else img.float()
+        # return img.float().div(255) if self.div else img.float()
+        return img.float().div(255) * 2 - 1.
 
 
 class IdentityTransform(object):

@@ -1,5 +1,5 @@
 import argparse
-import os,sys
+import os, sys
 import time
 import shutil
 import torch
@@ -7,25 +7,36 @@ import torchvision
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim
-from torch.nn.utils import clip_grad_norm
+from torch.nn.utils import clip_grad_norm_
+import pandas as pd
+
 from log import log
-from dataset import ClipDataset
-#from p3d_model import *
-#from p3d_model import get_optim_policies
-#from I3D_Pytorch import *
-from S3DG_Pytorch import *
+# from dataset import ClipDataset
+# from p3d_model import *
+# from p3d_model import get_optim_policies
+# from I3D_Pytorch import *
+from S3DG_Pytorch import S3DG
 from transforms import *
 from IPython import embed
-from dataloader_pkl import KineticsPKL
+# from dataloader_pkl import KineticsPKL
+from dataset_virat import ViratDataSet, ViratValDataSet, costum_collate
+from config import LABEL_MAPPING_2_CLASS, LABEL_MAPPING_3_CLASS, LABEL_MAPPING_2_CLASS2
+
 best_prec1=0
 channel_dim=1
 
+
 def get_args():
     parser = argparse.ArgumentParser(description="TAL")
-    parser.add_argument('dataset', type=str, choices=['kinetics'])
+    parser.add_argument('dataset', type=str)
     parser.add_argument('modality', type=str, choices=['RGB', 'Flow'])
-    parser.add_argument('train_list', type=str)
-    parser.add_argument('val_list', type=str)
+    parser.add_argument('--num_class', type=int, default=13)
+    parser.add_argument('--train_list', type=str)
+    parser.add_argument('--val_list', type=str)
+    parser.add_argument('--data_length', type=int, default=64)
+    parser.add_argument('--mapping', default='', type=str)
+    parser.add_argument('--data_path', type=str)
+    parser.add_argument('--pretrained_weights', type=str)
     # ========================= Model Configs ==========================
     parser.add_argument('--arch', type=str, default="S3DG",choices=['S3DG'])
     parser.add_argument('--dropout', '--do', default=0.5, type=float, metavar='DO', help='dropout ratio (default: 0.5)')
@@ -55,37 +66,91 @@ def get_args():
     return Args
 
 
+def get_augmentation(modality, input_size):
+    if modality == 'RGB':
+        return torchvision.transforms.Compose([GroupMultiScaleCrop(input_size, [1, .875, .75, .66]),
+                                               GroupRandomHorizontalFlip(is_flow=False)])
+    elif modality == 'Flow':
+        return torchvision.transforms.Compose([GroupMultiScaleCrop(input_size, [1, .875, .75]),
+                                               GroupRandomHorizontalFlip(is_flow=True)])
+
+
+def compose_transform(mode, modality):
+    crop_size = 224
+    scale_size = 256
+    # ToDo: is it right for Flow?
+    if modality == 'Flow':
+        input_mean = [0.5]
+        input_std = [np.mean([0.229, 0.224, 0.225]).item()]
+    else:
+        input_mean = [0.485, 0.456, 0.406]
+        input_std = [0.229, 0.224, 0.225]
+
+    # policies = model.get_optim_policies()
+    # ToDo: augmentation like i3d or tsn?
+    train_augmentation = get_augmentation(modality, crop_size)
+    normalize = GroupNormalize(input_mean, input_std)
+
+    # input is RGB, so roll is False
+    if mode == 'train':
+        transform = torchvision.transforms.Compose([
+            train_augmentation,
+            # ToDo: roll, div
+            Stack(),
+            ToTorchFormatTensor(div=True),
+            # normalize,
+        ])
+    else:
+        transform = torchvision.transforms.Compose([
+            GroupScale(int(scale_size)),
+            GroupCenterCrop(crop_size),
+            Stack(),
+            ToTorchFormatTensor(div=True),
+            # normalize,
+        ])
+
+    return transform
+
+
 def main():
     global args,best_prec1
     args=get_args()
 
+    if args.mapping == 'mapping_2':
+        MAPPING_LABEL = LABEL_MAPPING_2_CLASS
+    elif args.mapping == 'mapping_3':
+        MAPPING_LABEL = LABEL_MAPPING_3_CLASS
+    else:
+        MAPPING_LABEL = None
+
     log.l.info('Input command:\npython '+ ' '.join(sys.argv)+'  ===========>')
     
-    if args.dataset == 'kinetics':
-        num_class = 400
-    else:
-        raise ValueError('Unknown dataset '+args.dataset)
+    # if args.dataset == 'kinetics':
+    #     num_class = 400
+    # else:
+    #     raise ValueError('Unknown dataset '+args.dataset)
+    num_class = args.num_class
 
     log.l.info('============= prepare the model and model\'s parameters =============')
 
-    if args.arch=='S3DG':
-        input_channel=3 if args.modality=='RGB' else 2
-        model=S3DG(num_classes=num_class,input_channel=input_channel,dropout_keep_prob=0.5)
-        model.load_state_dict('modelweights/{}_imagenet.pkl'.format(args.modality))
+    if args.arch == 'S3DG':
+        input_channel = 3 if args.modality == 'RGB' else 2
+        model = S3DG(num_classes=num_class, input_channel=input_channel, dropout_keep_prob=args.dropout)
+        if args.pretrained_weights:
+            model.load_state_dict(args.pretrained_weights)
     else:
-        raise ValueError('Unknown model'+ args.arch)
+        raise ValueError('Unknown model' + args.arch)
 
-    #model=transfer_model(model,num_classes=num_class)
+    # model=transfer_model(model,num_classes=num_class)
 
-    crop_size = 224# model.crop_size
-    #scale_size = model.scale_size
-    input_mean = [0.485,0.456,0.406]#model.input_mean
-    input_std = [0.229,0.224,0.225]#model.input_std
-    temporal_length = 64#model.temporal_length
-   
+    crop_size = 224  # model.crop_size
+    # scale_size = model.scale_size
+    input_mean = [0.485, 0.456, 0.406]  # model.input_mean
+    input_std = [0.229, 0.224, 0.225]  # model.input_std
+    temporal_length = 64  # model.temporal_length
 
-    #model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
-    model=torch.nn.DataParallel(model).cuda()
+    # model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
+    model = torch.nn.DataParallel(model).cuda()
     
     if args.resume:
         log.l.info('============== train from checkpoint (finetune mode) =================')
@@ -100,7 +165,7 @@ def main():
         else:
             log.l.info(("=> no checkpoint found at '{}'".format(args.resume)))
 
-
+    #
     log.l.info('============== Now, loading data ... ==============\n')
     # Data loading code
     normalize = GroupNormalize(input_mean, input_std)
@@ -110,32 +175,48 @@ def main():
         data_channel = 2 
     
     is_gray=False if args.modality=='RGB' else True
-    Kinetics_train=KineticsPKL(args.train_list,seglen=64,is_train=True,cropsize=crop_size,
-                   transform=torchvision.transforms.Compose([
-                       GroupScale((256,256)),
-                       #train_augmentation,
-                       #GroupRandomCrop(crop_size),
-                       GroupMultiScaleCrop(224,[1,0.875,0.75,0.66]),
-                       GroupRandomHorizontalFlip(),
-                       Stack(),
-                       ToTorchFormatTensor(div=args.arch != 'BNInception'),
-                       normalize,
-                   ]))
-    train_loader = torch.utils.data.DataLoader(
-        Kinetics_train,
-        batch_size=args.batch_size, shuffle=True,
-        num_workers=args.data_workers, pin_memory=True,drop_last=True)
+    # Kinetics_train=KineticsPKL(args.train_list,seglen=64,is_train=True,cropsize=crop_size,
+    #                transform=torchvision.transforms.Compose([
+    #                    GroupScale((256,256)),
+    #                    #train_augmentation,
+    #                    #GroupRandomCrop(crop_size),
+    #                    GroupMultiScaleCrop(224,[1,0.875,0.75,0.66]),
+    #                    GroupRandomHorizontalFlip(),
+    #                    Stack(),
+    #                    ToTorchFormatTensor(div=args.arch != 'BNInception'),
+    #                    normalize,
+    #                ]))
+    virat_train = ViratDataSet(args.data_path, args.train_list,
+                               new_length=args.data_length,
+                               modality=args.modality,
+                               transform=compose_transform('train', args.modality),
+                               mapping=MAPPING_LABEL)
 
-    Kinetics_val=KineticsPKL(args.val_list,seglen=64,is_train=False,cropsize=crop_size,
-                   transform=torchvision.transforms.Compose([
-                       GroupScale((256,256)),
-                       GroupCenterCrop(224),
-                       Stack(),
-                       ToTorchFormatTensor(div=args.arch != 'BNInception'),
-                       normalize,
-                   ]))
+    weights = make_weights_for_unbalance_classes(args.train_list, mapping=MAPPING_LABEL)
+    sampler = torch.utils.data.sampler.WeightedRandomSampler(torch.Tensor(weights), weights.size)
+    train_loader = torch.utils.data.DataLoader(
+        virat_train,
+        batch_size=args.batch_size, shuffle=False, sampler=sampler,
+        num_workers=args.data_workers, pin_memory=True, drop_last=True)
+
+    # Kinetics_val=KineticsPKL(args.val_list,seglen=64,is_train=False,cropsize=crop_size,
+    #                transform=torchvision.transforms.Compose([
+    #                    GroupScale((256,256)),
+    #                    GroupCenterCrop(224),
+    #                    Stack(),
+    #                    ToTorchFormatTensor(div=args.arch != 'BNInception'),
+    #                    normalize,
+    #                ]))
+    virat_val = ViratDataSet(
+        args.data_path, args.val_list,
+        new_length=args.data_length,
+        modality=args.modality,
+        transform=compose_transform('val', args.modality),
+        test_mode=True,
+        mapping=MAPPING_LABEL
+    )
     val_loader = torch.utils.data.DataLoader(
-        Kinetics_val,
+        virat_val,
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.data_workers, pin_memory=True,drop_last=True)
     log.l.info('================= Now, define loss function and optimizer ==============')
@@ -176,6 +257,7 @@ def main():
                 'best_prec1': best_prec1,
             }, is_best)
 
+
 def train(train_loader, model, criterion, optimizer, epoch):
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -187,7 +269,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
     model.train()
     end = time.time()
 
-    for i, (input, target,vid) in enumerate(train_loader):
+    for i, (input, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
         target = target.cuda(async=True)
@@ -197,11 +279,10 @@ def train(train_loader, model, criterion, optimizer, epoch):
         output = model(input_var)[0]
         loss = criterion(output, target_var)
         # measure accuracy and record loss
-        prec1, prec5 = accuracy(output.data, target, topk=(1,5))
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
-        top5.update(prec5[0], input.size(0))
-
+        prec1, prec5 = accuracy(output.data, target, topk=(1, 2))
+        losses.update(loss.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
+        top5.update(prec5.item(), input.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -209,7 +290,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         loss.backward()
 
         if args.clip_gradient is not None:
-            total_norm = clip_grad_norm(model.parameters(), args.clip_gradient)
+            total_norm = clip_grad_norm_(model.parameters(), args.clip_gradient)
             if total_norm > args.clip_gradient:
                 log.l.info("clipping gradient: {} with coef {}".format(total_norm, args.clip_gradient / total_norm))
 
@@ -221,13 +302,14 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
         if i % args.print_freq == 0:
             log.l.info(('Epoch: [{0}][{1}/{2}], lr: {lr:.5f}\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   epoch, i, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1, top5=top5, lr=optimizer.param_groups[-1]['lr'])))
+                        'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                        'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                        'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                        'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                        'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                         epoch, i, len(train_loader), batch_time=batch_time,
+                         data_time=data_time, loss=losses, top1=top1, top5=top5, lr=optimizer.param_groups[-1]['lr'])))
+
 
 def validate(val_loader, model, criterion, iter, logger=None):
     batch_time = AverageMeter()
@@ -239,40 +321,42 @@ def validate(val_loader, model, criterion, iter, logger=None):
     model.eval()
 
     end = time.time()
-    for i, (input, target,is_posi) in enumerate(val_loader):
-        target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input, volatile=True)
-        
-        target_var = torch.autograd.Variable(target, volatile=True)
+    with torch.no_grad():
+        for i, (input, target) in enumerate(val_loader):
+            target = target.cuda(async=True)
+            input_var = torch.autograd.Variable(input)
 
-        # compute output
-        output = model(input_var)[0]
-        loss = criterion(output, target_var)
+            target_var = torch.autograd.Variable(target)
 
-        # measure accuracy and record loss
-        prec1, prec5 = accuracy(output.data, target, topk=(1,5))
+            # compute output
+            output = model(input_var)[0]
+            loss = criterion(output, target_var)
 
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
-        top5.update(prec5[0], input.size(0))
+            # measure accuracy and record loss
+            prec1, prec5 = accuracy(output.data, target, topk=(1, 2))
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+            losses.update(loss.item(), input.size(0))
+            top1.update(prec1.item(), input.size(0))
+            top5.update(prec5.item(), input.size(0))
 
-        if i % args.print_freq == 0:
-            log.l.info(('Test: [{0}/{1}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   i, len(val_loader), batch_time=batch_time, loss=losses,
-                   top1=top1, top5=top5)))
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                log.l.info(('Test: [{0}/{1}]\t'
+                            'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                            'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                            'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                            'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                             i, len(val_loader), batch_time=batch_time, loss=losses,
+                             top1=top1, top5=top5)))
 
     log.l.info(('Testing Results: Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Loss {loss.avg:.5f}'
           .format(top1=top1, top5=top5, loss=losses)))
 
     return top1.avg
+
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     filename = '_'.join((args.snapshot_pref, args.modality.lower(), filename))
@@ -280,6 +364,7 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     if is_best:
         best_name = '_'.join((args.snapshot_pref, args.modality.lower(), 'model_best.pth.tar'))
         shutil.copyfile(filename, best_name)
+
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -305,8 +390,8 @@ def adjust_learning_rate(optimizer, epoch, lr_steps):
     lr = args.lr * decay
     decay = args.weight_decay
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr #* param_group['lr_mult']
-        param_group['weight_decay'] = decay #* param_group['decay_mult']
+        param_group['lr'] = lr  #* param_group['lr_mult']
+        param_group['weight_decay'] = decay  #* param_group['decay_mult']
 
 
 def accuracy(output, target, topk=(1,)):
@@ -323,6 +408,29 @@ def accuracy(output, target, topk=(1,)):
         correct_k = correct[:k].view(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
+
+
+def make_weights_for_unbalance_classes(label_csv_path, mapping):
+    dir_label_df = pd.read_csv(label_csv_path, sep=' ', header=None)
+    sample_num = dir_label_df.shape[0]
+    print('All samples num:', sample_num)
+    column_names = ['activity', 'length', 'label', 'offset', 'reverse', 'mapping']
+
+    dir_label_df.columns = column_names[:dir_label_df.shape[1]]
+    if mapping:
+        dir_label_df['label'] = dir_label_df['label'].map(lambda x: mapping[x])
+    weights = np.zeros(sample_num)
+    num_class = 1 + dir_label_df['label'].max()
+    for i in range(num_class):
+        this_class_sample = dir_label_df[dir_label_df['label'] == i]
+        assert this_class_sample.shape[0] != 0
+        weight = sample_num / this_class_sample.shape[0]
+        if i == 13:
+            weight = weights.min()+1.
+        weights[dir_label_df['label'] == i] = weight
+        print('class', i, this_class_sample.shape[0], weight)
+
+    return weights
 
 
 if __name__=='__main__':
